@@ -1,0 +1,8 @@
+# ClassEval-Pro's execution environment (see dop.sandbox): what its
+# reference solutions and tests import.
+# This is the only place benchmark dependencies are declared; the harness
+# itself never imports them. Keep Python's minor version in step with
+# .python-version.
+FROM docker.io/library/python:3.14-slim
+RUN pip install --no-cache-dir numpy==2.5.4
+WORKDIR /sandbox

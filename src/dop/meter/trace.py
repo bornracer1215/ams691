@@ -5,6 +5,13 @@ agent that made it, so post-hoc analysis can answer "how much of the
 Supervisor-Worker budget went to coordination messages rather than task
 work" without re-running anything.
 
+Call records also carry the transcript: `input` holds the messages added
+to that agent's conversation since its previous call (the whole prompt on
+its first; after that, its own previous reply, tool output, nudges and
+so on), and `text` and `tool_call` the reply. An agent's conversation only ever
+grows, so concatenating its inputs rebuilds every prompt exactly;
+`input_from` says where each one starts.
+
 Design the schema before the pilot. Changing it afterward means
 re-running every configuration.
 """
@@ -14,26 +21,27 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .ledger import Usage
+from ..clients.base import Message, ToolCall, Usage
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
 class RunMeta:
     run_id: str
-    architecture: str          # single | best_of_n | supervisor_worker | debate
+    topology: str  # single | best_of_n | supervisor_worker | debate
     task_id: str
-    task_category: str         # coding | reasoning | database
-    task_shape: str            # decomposable | sequential | tool_feedback
+    task_category: str  # coding | reasoning | database
+    task_shape: str  # decomposable | sequential | tool_feedback
     cap: int
     model: str
     seed: int | None = None
-    temperature: float = 0.0
+    temperature: float | None = None  # None: the provider's default
     thinking_budget: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -46,6 +54,7 @@ class TraceWriter:
         self._lock = threading.Lock()
         self._seq = 0
         self._t0 = time.time()
+        self._logged: dict[str, int] = {}  # agent_id -> messages already in the trace
         self._fh = self.path.open("w", encoding="utf-8")
         self._emit(
             "run_start",
@@ -79,7 +88,15 @@ class TraceWriter:
         cap: int,
         finish_reason: str,
         n_messages: int,
+        messages: Sequence[Message] = (),
+        text: str | None = None,
+        tool_call: ToolCall | None = None,
     ) -> None:
+        with self._lock:
+            start = self._logged.get(agent_id, 0)
+            if start > len(messages):  # not a continuation; log it whole
+                start = 0
+            self._logged[agent_id] = len(messages)
         self._emit(
             "call",
             {
@@ -96,6 +113,14 @@ class TraceWriter:
                 "remaining_after": cap - spent_after,
                 "finish_reason": finish_reason,
                 "n_messages": n_messages,
+                "input_from": start,
+                "input": [m.to_dict() for m in messages[start:]],
+                "text": text,
+                "tool_call": (
+                    {"name": tool_call.name, "args": tool_call.args}
+                    if tool_call
+                    else None
+                ),
             },
         )
 
@@ -135,8 +160,12 @@ class TraceWriter:
     def halt(self, *, agent_id: str, requested: int, remaining: int) -> None:
         self._emit(
             "halt",
-            {"agent_id": agent_id, "requested": requested, "remaining": remaining,
-             "reason": "budget_exhausted"},
+            {
+                "agent_id": agent_id,
+                "requested": requested,
+                "remaining": remaining,
+                "reason": "budget_exhausted",
+            },
         )
 
     def finish(
@@ -147,14 +176,20 @@ class TraceWriter:
         ledger_summary: dict[str, Any],
         score: float | None = None,
         grader_detail: dict[str, Any] | None = None,
+        status: str = "ok",
+        topology_detail: dict[str, Any] | None = None,
     ) -> None:
+        """status is "ok", or "error" when the run crashed: an error run
+        should be re-run, not scored."""
         self._emit(
             "run_end",
             {
+                "status": status,
                 "answer": answer,
                 "halted": halted,
                 "score": score,
                 "grader_detail": grader_detail or {},
+                "topology_detail": topology_detail or {},
                 "ledger": ledger_summary,
             },
         )
@@ -164,7 +199,7 @@ class TraceWriter:
         if not self._fh.closed:
             self._fh.close()
 
-    def __enter__(self) -> "TraceWriter":
+    def __enter__(self) -> TraceWriter:
         return self
 
     def __exit__(self, *exc) -> bool:

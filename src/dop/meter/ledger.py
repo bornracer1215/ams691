@@ -23,36 +23,17 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
-
-@dataclass(frozen=True)
-class Usage:
-    """Provider-reported token usage for a single model call."""
-
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    thinking_tokens: int = 0
-
-    @property
-    def total(self) -> int:
-        return self.prompt_tokens + self.completion_tokens + self.thinking_tokens
-
-    def __add__(self, other: "Usage") -> "Usage":
-        return Usage(
-            self.prompt_tokens + other.prompt_tokens,
-            self.completion_tokens + other.completion_tokens,
-            self.thinking_tokens + other.thinking_tokens,
-        )
+from ..clients.base import Usage
 
 
 class BudgetExhausted(Exception):
     """Raised when a reservation does not fit in the remaining budget.
 
-    Architectures must catch this and return their best answer so far with
-    halted=True, rather than letting it propagate as a crash. A halted run
-    is scored as-is, never as zero.
+    The agent loop catches this: the agent stops, and its answer is
+    whatever it had already submitted (see dop.agent).
     """
 
     def __init__(self, requested: int, remaining: int, agent_id: str = "") -> None:
@@ -80,9 +61,9 @@ class LedgerEvent:
 class Reservation:
     """A hold on part of the budget. Commit it or release it, exactly once."""
 
-    __slots__ = ("_ledger", "amount", "agent_id", "_closed")
+    __slots__ = ("_closed", "_ledger", "agent_id", "amount")
 
-    def __init__(self, ledger: "BudgetLedger", amount: int, agent_id: str) -> None:
+    def __init__(self, ledger: BudgetLedger, amount: int, agent_id: str) -> None:
         self._ledger = ledger
         self.amount = amount
         self.agent_id = agent_id
@@ -101,7 +82,7 @@ class Reservation:
         self._closed = True
         self._ledger._release(self)
 
-    def __enter__(self) -> "Reservation":
+    def __enter__(self) -> Reservation:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
@@ -130,8 +111,8 @@ class BudgetLedger:
         self._lock = threading.Lock()
         self._seq = 0
         self._t0 = time.time()
-        self._parent: "BudgetLedger | None" = None
-        self._parent_res: "Reservation | None" = None
+        self._parent: BudgetLedger | None = None
+        self._parent_res: Reservation | None = None
         self._parent_agent = ""
         self._settled = False
         self.events: list[LedgerEvent] = []
@@ -205,20 +186,20 @@ class BudgetLedger:
 
     # -- deliberate sub-allocation -------------------------------------
 
-    def allocate(self, amount: int, agent_id: str = "worker") -> "BudgetLedger":
+    def allocate(self, amount: int, agent_id: str = "worker") -> BudgetLedger:
         """Carve a guaranteed sub-budget out of this ledger.
 
         Pure first-come-first-served lets one agent drain the cap before a
         concurrently-started sibling makes its first reservation, so a
         worker can end up with zero calls for reasons of thread scheduling
-        rather than anything about the architecture. That is
+        rather than anything about the topology. That is
         nondeterministic variance injected straight into the measurement.
 
         Topologies that fan out should therefore allocate explicitly: the
         supervisor decides each worker's slice, the worker spends only
         from it, and whatever it does not spend returns to the parent on
         settle(). The allocation policy becomes a documented property of
-        the architecture rather than an artifact of the GIL.
+        the topology rather than an artifact of the GIL.
         """
         res = self.reserve(amount, agent_id=agent_id)
         child = BudgetLedger(amount, run_id=f"{self.run_id}/{agent_id}")
@@ -239,8 +220,15 @@ class BudgetLedger:
             self._parent_res, usage, calls, refusals, overshoot, self._parent_agent
         )
 
-    def _absorb(self, res, usage: Usage, calls: int, refusals: int,
-                overshoot: int, agent_id: str) -> None:
+    def _absorb(
+        self,
+        res,
+        usage: Usage,
+        calls: int,
+        refusals: int,
+        overshoot: int,
+        agent_id: str,
+    ) -> None:
         with self._lock:
             self._held -= res.amount
             self._spent += usage.total
@@ -249,13 +237,18 @@ class BudgetLedger:
             self.refusals += refusals
             self.overshoot += overshoot
             self._record(
-                "absorb", agent_id, usage.total,
-                detail={"allocated": res.amount, "calls": calls,
-                        "unused": res.amount - usage.total},
+                "absorb",
+                agent_id,
+                usage.total,
+                detail={
+                    "allocated": res.amount,
+                    "calls": calls,
+                    "unused": res.amount - usage.total,
+                },
             )
         res._closed = True
 
-    def __enter__(self) -> "BudgetLedger":
+    def __enter__(self) -> BudgetLedger:
         return self
 
     def __exit__(self, *exc) -> bool:

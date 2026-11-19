@@ -1,0 +1,6 @@
+# LiveSQLBench's execution environment (see dop.sandbox). The upstream
+# evaluator (fetched at a pinned commit, see manifest.json) needs only the
+# standard library, sqlite3 included. Keep Python's minor version in step
+# with .python-version.
+FROM docker.io/library/python:3.14-slim
+WORKDIR /sandbox

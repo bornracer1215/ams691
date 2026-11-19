@@ -1,6 +1,6 @@
 """Exit criterion for WP1 week 1.
 
-Three properties must hold before any architecture work begins:
+Three properties must hold before any topology work begins:
 
   1. A runaway agent halts at the cap and never exceeds it.
   2. Ledger total equals the sum of provider-reported usage, exactly.
@@ -16,10 +16,9 @@ import concurrent.futures as cf
 
 import pytest
 
-from dop.clients.base import Message
+from dop.clients.base import Message, Usage
 from dop.clients.mock import MockClient
-from dop.ledger import BudgetExhausted, BudgetLedger, Usage
-from dop.metering import MeteredClient
+from dop.meter import BudgetExhausted, BudgetLedger, MeteredClient
 
 
 def msgs(n_words: int = 20) -> list[Message]:
@@ -27,6 +26,7 @@ def msgs(n_words: int = 20) -> list[Message]:
 
 
 # ---------------------------------------------------------------- 1 ---
+
 
 def test_runaway_agent_halts_at_cap():
     """An agent instructed to loop forever stops at the cap, never above."""
@@ -39,7 +39,7 @@ def test_runaway_agent_halts_at_cap():
     halted = False
     for _ in range(10_000):  # would never terminate on its own
         try:
-            resp = mc.generate(history)
+            mc.generate(history)
         except BudgetExhausted:
             halted = True
             break
@@ -69,8 +69,9 @@ def test_context_regrowth_is_charged_every_turn():
     spend in a long loop.
     """
     ledger = BudgetLedger(200_000)
-    mc = MeteredClient(MockClient(completion_tokens=50), ledger,
-                       default_max_output_tokens=64)
+    mc = MeteredClient(
+        MockClient(completion_tokens=50), ledger, default_max_output_tokens=64
+    )
     history = msgs(50)
     for _ in range(20):
         mc.generate(history)
@@ -81,12 +82,15 @@ def test_context_regrowth_is_charged_every_turn():
 
 # ---------------------------------------------------------------- 2 ---
 
+
 def test_ledger_total_equals_sum_of_provider_usage():
     ledger = BudgetLedger(500_000)
-    client = MockClient(completion_tokens=lambda i: 40 + i,
-                        thinking_tokens=lambda i: 10 * i)
-    mc = MeteredClient(client, ledger, default_max_output_tokens=512,
-                       thinking_budget=512)
+    client = MockClient(
+        completion_tokens=lambda i: 40 + i, thinking_tokens=lambda i: 10 * i
+    )
+    mc = MeteredClient(
+        client, ledger, default_max_output_tokens=512, thinking_budget=512
+    )
 
     manual = Usage()
     history = msgs(25)
@@ -107,8 +111,9 @@ def test_thinking_tokens_are_charged():
     this project exists to correct."""
     ledger = BudgetLedger(100_000)
     client = MockClient(completion_tokens=100, thinking_tokens=400)
-    mc = MeteredClient(client, ledger, default_max_output_tokens=128,
-                       thinking_budget=512)
+    mc = MeteredClient(
+        client, ledger, default_max_output_tokens=128, thinking_budget=512
+    )
     resp = mc.generate(msgs(10))
 
     assert resp.usage.thinking_tokens == 400
@@ -143,6 +148,7 @@ def test_tokenizer_undercount_is_recorded_as_overshoot():
 
 
 # ---------------------------------------------------------------- 3 ---
+
 
 def test_parallel_agents_never_collectively_overspend():
     """Supervisor-Worker and Debate run agents concurrently against one
@@ -182,14 +188,13 @@ def test_allocation_guarantees_every_worker_a_slice():
     cap = 60_000
     ledger = BudgetLedger(cap, run_id="allocated")
     client = MockClient(completion_tokens=300)
-    root = MeteredClient(client, ledger, default_max_output_tokens=384)
-
     slice_size = 12_000  # supervisor keeps 12k for itself
 
     def worker(wid: int) -> tuple[int, int]:
         child = ledger.allocate(slice_size, agent_id=f"worker-{wid}")
-        mc = MeteredClient(client, child, agent_id=f"worker-{wid}",
-                           default_max_output_tokens=384)
+        mc = MeteredClient(
+            client, child, agent_id=f"worker-{wid}", default_max_output_tokens=384
+        )
         history = msgs(40)
         calls = 0
         try:
@@ -221,8 +226,9 @@ def test_allocation_guarantees_every_worker_a_slice():
 
 def test_sub_agents_share_the_parent_ledger():
     ledger = BudgetLedger(100_000)
-    root = MeteredClient(MockClient(completion_tokens=20), ledger,
-                         default_max_output_tokens=32)
+    root = MeteredClient(
+        MockClient(completion_tokens=20), ledger, default_max_output_tokens=32
+    )
     a, b = root.for_agent("a"), root.for_agent("b")
     a.generate(msgs(5))
     b.generate(msgs(5))

@@ -8,11 +8,14 @@ assert the ledger did the right thing.
 
 from __future__ import annotations
 
+import json
 import re
-from typing import Callable, Sequence
+import threading
+from collections.abc import Callable, Sequence
 
-from ..ledger import Usage
-from .base import Message, Response
+from .base import Message, Response, ToolCall, ToolSpec, Usage
+
+Reply = str | ToolCall | tuple[str, ToolCall | None]
 
 _WORD = re.compile(r"\S+")
 
@@ -33,8 +36,10 @@ class MockClient:
     thinking_tokens
         Tokens of hidden reasoning to report per call. Same forms.
     responder
-        Produces the response text from the message list. Defaults to a
-        short canned reply.
+        Produces the reply from the message list and call index: a string
+        (plain text), a ToolCall, or a (text, ToolCall) pair. Defaults to a
+        short canned text reply. The tools offered, and any tool_choice,
+        are recorded in `offered`, but not enforced.
     undercount
         Tokens by which count_tokens should UNDERSTATE the true prompt, to
         simulate an inaccurate tokenizer and exercise overshoot tracking.
@@ -46,7 +51,7 @@ class MockClient:
         model: str = "mock-1",
         completion_tokens: int | Callable[[int], int] = 50,
         thinking_tokens: int | Callable[[int], int] = 0,
-        responder: Callable[[Sequence[Message], int], str] | None = None,
+        responder: Callable[[Sequence[Message], int], Reply] | None = None,
         undercount: int = 0,
     ) -> None:
         self.model = model
@@ -56,6 +61,8 @@ class MockClient:
         self._undercount = undercount
         self.call_count = 0
         self.seen: list[list[Message]] = []
+        self.offered: list[tuple[list[str], list[str] | None]] = []
+        self._lock = threading.Lock()  # topologies call from several threads
 
     # -- helpers -------------------------------------------------------
 
@@ -63,40 +70,70 @@ class MockClient:
     def _resolve(spec, idx: int) -> int:
         return spec(idx) if callable(spec) else int(spec)
 
-    def _true_prompt_tokens(self, messages: Sequence[Message]) -> int:
-        return sum(naive_token_count(m.content) + 3 for m in messages)
+    def _true_prompt_tokens(
+        self, messages: Sequence[Message], tools: Sequence[ToolSpec] = ()
+    ) -> int:
+        n = 0
+        for m in messages:
+            n += naive_token_count(m.content) + 3
+            if m.tool_call:
+                n += naive_token_count(json.dumps(m.tool_call.args))
+        for t in tools:
+            n += naive_token_count(
+                f"{t.name} {t.description} {json.dumps(t.parameters)}"
+            )
+        return n
 
     # -- LLMClient -----------------------------------------------------
 
-    def count_tokens(self, messages: Sequence[Message]) -> int:
-        return max(1, self._true_prompt_tokens(messages) - self._undercount)
+    def count_tokens(
+        self, messages: Sequence[Message], tools: Sequence[ToolSpec] = ()
+    ) -> int:
+        return max(1, self._true_prompt_tokens(messages, tools) - self._undercount)
+
+    def calibrate(self, messages, tools, prompt_tokens) -> None:
+        """Nothing to learn: count_tokens is already exact (or deliberately
+        wrong, with `undercount`)."""
 
     def generate(
         self,
         messages: Sequence[Message],
         *,
         max_output_tokens: int,
-        temperature: float = 0.0,
+        temperature: float | None = None,  # None: the provider's default
         thinking_budget: int = 0,
         seed: int | None = None,
-        stop: Sequence[str] | None = None,
+        tools: Sequence[ToolSpec] = (),
+        tool_choice: Sequence[str] | None = None,
     ) -> Response:
-        idx = self.call_count
-        self.call_count += 1
-        self.seen.append(list(messages))
+        with self._lock:
+            idx = self.call_count
+            self.call_count += 1
+            self.seen.append(list(messages))
+            self.offered.append(
+                ([t.name for t in tools], list(tool_choice) if tool_choice else None)
+            )
 
         completion = min(self._resolve(self._completion, idx), max_output_tokens)
         thinking = min(self._resolve(self._thinking, idx), thinking_budget)
 
-        if self._responder is not None:
-            text = self._responder(messages, idx)
+        reply = (
+            self._responder(messages, idx)
+            if self._responder is not None
+            else f"mock response {idx}"
+        )
+        if isinstance(reply, ToolCall):
+            text, call = "", reply
+        elif isinstance(reply, tuple):
+            text, call = reply
         else:
-            text = f"mock response {idx}"
+            text, call = reply, None
 
         return Response(
             text=text,
+            tool_call=call,
             usage=Usage(
-                prompt_tokens=self._true_prompt_tokens(messages),
+                prompt_tokens=self._true_prompt_tokens(messages, tools),
                 completion_tokens=completion,
                 thinking_tokens=thinking,
             ),

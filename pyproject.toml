@@ -1,0 +1,27 @@
+[project]
+name = "dop"
+version = "0.1.0"
+description = "Does Orchestration Pay? Token-matched ablation of multi-agent LLM architectures."
+requires-python = ">=3.14"
+dependencies = [
+    "certifi",  # CA bundle for dataset downloads; see tasks/classeval_pro.py
+    "google-genai>=1.0",
+    "llm-sandbox[podman]>=0.3.46",
+    # imported by ClassEval-Pro solutions and tests
+    "pre-commit>=4.7.0",
+    "pytest>=8",
+    "python-dotenv>=1.2.4",
+]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+# pyflakes + pycodestyle errors (ruff's classic defaults), plus import
+# sorting, bugbear and pyupgrade. Set explicitly so every machine runs the
+# same rules regardless of any user-level ruff config.
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"
